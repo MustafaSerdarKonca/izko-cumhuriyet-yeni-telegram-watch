@@ -123,35 +123,42 @@ def get_price_via_headless_dom(url: str) -> Decimal | None:
         print(f"[ERROR] Playwright import edilemedi: {e}")
         return None
 
-    # 3 deneme, küçük backoff ile
     for attempt in range(1, 4):
         try:
             with sync_playwright() as p:
+                # viewport AYARI context'e verilir (new_page'e değil!)
                 browser = p.chromium.launch()
-                context = browser.new_context(locale="tr-TR", timezone_id="Europe/Istanbul")
-                page = context.new_page(viewport={"width": 1280, "height": 1600})
+                context = browser.new_context(
+                    locale="tr-TR",
+                    timezone_id="Europe/Istanbul",
+                    viewport={"width": 1280, "height": 1600}
+                )
+                page = context.new_page()
                 page.goto(url, timeout=30000, wait_until="networkidle")
 
                 # 1) Doğrudan hedef seçici
+                txt = ""
                 try:
-                    page.wait_for_selector("#row7_satis #ataLabel", timeout=5000)
-                    txt = page.eval_on_selector("#row7_satis #ataLabel", "el => (el.textContent || '').trim()")
+                    page.wait_for_selector("#row7_satis #ataLabel", timeout=7000)
+                    txt = page.eval_on_selector(
+                        "#row7_satis #ataLabel",
+                        "el => (el.textContent || '').trim()"
+                    )
                 except Exception:
-                    txt = ""
+                    pass
 
-                # 2) Satırdan yakala (Cumhuriyet satırı)
+                # 2) Cumhuriyet satırından yakala
                 if not txt:
                     row = page.locator("tr:has-text('Cumhuriyet')").first
-                    if row and row.count() >= 0:
-                        try:
-                            row.wait_for(timeout=3000)
-                        except Exception:
-                            pass
-                        row_text = row.inner_text(timeout=5000) if row else ""
-                        # Satırdaki tüm sayılardan makul olanı seç (>= 1000)
-                        m = re.search(r"([0-9][0-9\.\,\s]{2,})", row_text)
-                        txt = m.group(1) if m else ""
+                    try:
+                        row.wait_for(timeout=5000)
+                        row_text = row.inner_text(timeout=5000)
+                    except Exception:
+                        row_text = ""
+                    m = re.search(r"([0-9][0-9\.\,\s]{2,})", row_text)
+                    txt = m.group(1) if m else ""
 
+                context.close()
                 browser.close()
 
                 if not txt:
