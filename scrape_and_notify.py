@@ -2,69 +2,44 @@
 # -*- coding: utf-8 -*-
 
 """
-İZKO 'Güncel Kur' sayfasındaki 'Cumhuriyet' satırındaki 'YENİ' fiyatı izler.
-- Önce BeautifulSoup ile DOM üzerinden çekmeye çalışır.
-- Olmazsa regex fallback uygular: r"Cumhuriyet[\s\S]{0,4000}?YENİ\s*:?\s*([0-9\.,]+)"
-- Durumu state/last_price.json dosyasında tutar.
-- Değişim varsa TELEGRAM mesajı yollar.
+İZKO 'Güncel Kur' sayfasında 'Cumhuriyet' SATIŞ fiyatını **JS sonrası DOM'dan** okur.
+- Headless Chromium (Playwright) ile sayfayı render eder.
+- Önce '#row7_satis #ataLabel' seçicisinden okur.
+- Olmazsa 'tr:has-text("Cumhuriyet")' satırındaki ilk makul sayıyı alır.
+- Son fiyatı state/last_price.json içinde tutar; değişirse Telegram'a mesaj atar.
 - İlk çalıştırmada baseline oluşturur, bildirim göndermez.
-- Ağ isteklerinde 10 sn timeout ve 3 deneme (exponential backoff) vardır.
-- Loglar print() ile yazılır; ayrıştırma başarısız olsa bile exit code 0 (workflow kırılmaz).
+- Log'lar print() ile GitHub Actions'da görünür.
 
-Bağımlılıklar: requests, bs4, pytz
-Python: 3.11+
+Gereken Secrets:
+- TELEGRAM_BOT_TOKEN
+- TELEGRAM_CHAT_ID
 """
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
-import os, json, re, time
+import os
+import re
+import json
+from pathlib import Path
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
-from pathlib import Path
 
 import pytz
 import requests
-from bs4 import BeautifulSoup
-from io import BytesIO
-from PIL import Image
-import pytesseract
 
 URL = "https://www.izko.org.tr/Home/GuncelKur"
 STATE_DIR = Path("state")
 STATE_FILE = STATE_DIR / "last_price.json"
 
-# 'Cumhuriyet'ten sonra ilk anlamlı sayıyı al (ör. 30410)
-FALLBACK_REGEX = re.compile(
-    r"Cumhuriyet[\s\S]{0,4000}?([0-9][0-9\.\,\s]{2,})", re.IGNORECASE
-)
-
-
 HEADERS = {
-    "User-Agent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                   "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+    )
 }
 
-def fetch_html(url: str, max_retries: int = 3, timeout: int = 10) -> str | None:
-    session = requests.Session()
-    backoff = 1
-    for attempt in range(1, max_retries + 1):
-        try:
-            r = session.get(url, headers=HEADERS, timeout=timeout)
-            if r.status_code == 200 and r.text:
-                print(f"[INFO] GET {url} -> 200 (attempt {attempt})")
-                return r.text
-            else:
-                print(f"[WARN] GET {url} -> {r.status_code} (attempt {attempt})")
-        except requests.RequestException as e:
-            print(f"[WARN] Request error (attempt {attempt}): {e}")
-        if attempt < max_retries:
-            time.sleep(backoff); backoff *= 2
-    print("[ERROR] HTML alınamadı; tüm denemeler tükendi.")
-    return None
-
-def _turkish_number_to_decimal(num_text: str) -> Decimal | None:
-    cleaned = (num_text or "").strip()
-    cleaned = cleaned.replace("\xa0", " ").replace(" ", "")
+def _turkish_number_to_decimal(txt: str) -> Decimal | None:
+    if not txt:
+        return None
+    cleaned = txt.strip().replace("\xa0", " ").replace(" ", "")
     cleaned = cleaned.replace(".", "").replace(",", ".")
     try:
         return Decimal(cleaned)
@@ -73,248 +48,46 @@ def _turkish_number_to_decimal(num_text: str) -> Decimal | None:
 
 def _format_tl(n: Decimal | int | float) -> str:
     try:
-        as_int = int(Decimal(n).quantize(Decimal("1")))
+        val = int(Decimal(n).quantize(Decimal("1")))
     except Exception:
-        as_int = int(float(n))
-    return f"{as_int:,}".replace(",", ".")
+        val = int(float(n))
+    return f"{val:,}".replace(",", ".")
 
-def parse_price_with_bs4(html: str) -> Decimal | None:
-    """
-    'Cumhuriyet' geçen satırı bul, aynı satır/ebeveyn bağlamındaki İLK anlamlı sayıyı çek.
-    (Sayfa 'Cumhuriyet' fiyatını SATIŞ sütununda veriyor.)
-    """
-    soup = BeautifulSoup(html, "html.parser")
+def _istanbul_now_str() -> tuple[str, str]:
+    tz = pytz.timezone("Europe/Istanbul")
+    now = datetime.now(tz)
+    offset = now.utcoffset()
+    total_minutes = int((offset.total_seconds() if offset else 3 * 3600) // 60)
+    sign = "+" if total_minutes >= 0 else "-"
+    total_minutes = abs(total_minutes)
+    hh, mm = divmod(total_minutes, 60)
+    return now.strftime("%Y-%m-%d %H:%M:%S"), f"{sign}{hh:02d}:{mm:02d}"
 
-    candidates = soup.find_all(string=re.compile(r"Cumhuriyet", re.IGNORECASE))
-    for text_node in candidates:
-        row = text_node.find_parent("tr") if getattr(text_node, "find_parent", None) else None
-        container = row or (text_node.parent if text_node else None)
-        if not container:
-            continue
+def build_message(old_price: Decimal, new_price: Decimal) -> str:
+    dt_str, offset = _istanbul_now_str()
+    return (
+        "İZKO Cumhuriyet Altını fiyatı değişti!\n"
+        f"Eski: {_format_tl(old_price)} TL\n"
+        f"Yeni: {_format_tl(new_price)} TL\n"
+        "Kaynak: izko.org.tr\n"
+        f"Zaman: {dt_str} ({offset})"
+    )
 
-        # Önce satır metninde tara
-        ctx_text = container.get_text(" ", strip=True)
-        m = re.search(r"([0-9][0-9\.\,\s]{2,})", ctx_text)
-        if m:
-            val = _turkish_number_to_decimal(m.group(1))
-            if val and val >= Decimal(1000):
-                print(f"[INFO] BS4 ile bulundu (SATIŞ): {m.group(1)} -> {val}")
-                return val
-
-        # Olmazsa ebeveynde dene (bazı layoutlarda satır kırık olabiliyor)
-        parent = container.find_parent() if hasattr(container, "find_parent") else None
-        if parent:
-            ptxt = parent.get_text(" ", strip=True)
-            m2 = re.search(r"([0-9][0-9\.\,\s]{2,})", ptxt)
-            if m2:
-                val2 = _turkish_number_to_decimal(m2.group(1))
-                if val2 and val2 >= Decimal(1000):
-                    print(f"[INFO] BS4 (ebeveyn) ile bulundu (SATIŞ): {m2.group(1)} -> {val2}")
-                    return val2
-
-    print("[WARN] BS4 ile fiyat bulunamadı; regex fallback denenecek.")
-    return None
-
-
-def parse_price_via_table(html: str) -> Decimal | None:
-    """
-    Tablo tabanlı ayrıştırma:
-    - Sayfadaki ilk/uygun <table> içinde thead/th başlıkları ara.
-    - 'Cumhuriyet' yazan satırı (tr) bul.
-    - Başlıklarda 'YENİ' hangi sütundaysa o hücrenin (td) metnini sayıya çevir.
-    """
-    soup = BeautifulSoup(html, "html.parser")
-
-    # 1) Tabloları sırayla dene
-    for table in soup.find_all("table"):
-        # Başlıkları topla
-        headers = []
-        thead = table.find("thead")
-        if thead:
-            ths = thead.find_all(["th", "td"])
-            headers = [th.get_text(" ", strip=True) for th in ths]
-
-        # thead yoksa ilk satırı başlık kabul etmeyi deneyelim
-        if not headers:
-            first_tr = table.find("tr")
-            if first_tr:
-                headers = [c.get_text(" ", strip=True) for c in first_tr.find_all(["th","td"])]
-
-        if not headers:
-            continue
-
-        # 'YENİ' sütun index'ini bul (toleranslı)
-        yeni_idx = None
-        for i, h in enumerate(headers):
-            ht = (h or "").strip().upper()
-            if "YEN" in ht:  # 'YENİ' / 'YENI' / 'YEN ' vb.
-                yeni_idx = i
-                break
-        if yeni_idx is None:
-            continue
-
-        # 2) Gövdede 'Cumhuriyet' geçen satırı bul
-        tbody = table.find("tbody") or table
-        for tr in tbody.find_all("tr"):
-            row_text = tr.get_text(" ", strip=True)
-            if not re.search(r"Cumhuriyet", row_text, flags=re.IGNORECASE):
-                continue
-
-            # Satırdaki hücreleri al
-            cells = tr.find_all(["td", "th"])
-            if not cells or yeni_idx >= len(cells):
-                continue
-
-            # 'YENİ' sütunundaki ham metin
-            yeni_cell = cells[yeni_idx]
-            # Hücre içinde ikon/span vs. olabilir; düz metni al
-            raw = yeni_cell.get_text(" ", strip=True)
-            # Eğer metin boşsa, içerikteki 'data-*' attribute’larına da bak (bazı siteler sayıyı attribute’ta tutar)
-            if not raw:
-                for attr, val in yeni_cell.attrs.items():
-                    if isinstance(val, str) and re.search(r"[0-9]", val):
-                        raw = val
-                        break
-
-            # Hücre içinden sayı çek (esnek)
-            m = re.search(r"([0-9][0-9\.\,\s]{1,})", raw)
-            num_txt = m.group(1) if m else raw
-
-            val = _turkish_number_to_decimal(num_txt)
-            if val is not None and val >= Decimal(1000):
-                print(f"[INFO] Tabloyla bulundu (YENİ): {num_txt} -> {val}")
-                return val
-
-    print("[WARN] Tablo tabanlı ayrıştırma başarısız.")
-    return None
-
-def parse_price_with_regex(html: str) -> Decimal | None:
-    m = FALLBACK_REGEX.search(html)
-    if not m:
-        print("[ERROR] Regex ile fiyat yakalanamadı.")
-        return None
-    val = _turkish_number_to_decimal(m.group(1))
-    if val is None:
-        print(f"[ERROR] Regex sayı parse edilemedi: '{m.group(1)}'")
-        return None
-    print(f"[INFO] Regex ile bulundu: {m.group(1)} -> {val}")
-    return val
-    
-def parse_price_row7(html: str) -> Decimal | None:
-    """
-    Ekrandaki yapıya göre: <td id="row7_satis"> içinde <div id="ataLabel">30410</div>
-    Cumhuriyet SATIŞ değeri burada duruyor. Önce DOM ile, olmazsa regex ile al.
-    """
-    soup = BeautifulSoup(html, "html.parser")
-
-    td = soup.find(id="row7_satis")
-    if td:
-        # 1) <div id="ataLabel">30410</div> varsa onu al
-        div = td.find(id="ataLabel")
-        if div and div.get_text(strip=True):
-            val = _turkish_number_to_decimal(div.get_text(strip=True))
-            if val:
-                print(f"[INFO] row7_satis/ataLabel ile bulundu: {val}")
-                return val
-
-        # 2) Hücrenin düz metnindeki ilk sayıyı al (ikonları, span’leri yok sayar)
-        raw = td.get_text(" ", strip=True)
-        m = re.search(r"([0-9][0-9\.\,\s]{2,})", raw)
-        if m:
-            val = _turkish_number_to_decimal(m.group(1))
-            if val:
-                print(f"[INFO] row7_satis metniyle bulundu: {val}")
-                return val
-
-    # 3) DOM bulunamazsa: HTML üzerinde regex (id kalıbına göre)
-    m = re.search(r'id=["\']row7_satis["\'][\s\S]{0,300}?id=["\']ataLabel["\'][^>]*>([0-9\.\,\s]+)<',
-                  html, flags=re.IGNORECASE)
-    if m:
-        val = _turkish_number_to_decimal(m.group(1))
-        if val:
-            print(f"[INFO] row7_satis regex ile bulundu: {val}")
-            return val
-
-    print("[WARN] row7_satis içinde değer bulunamadı.")
-    return None
-
-
-def parse_price_via_ocr(html: str) -> Decimal | None:
-    """
-    Sayfada görünen fiyat tablosu bir GÖRSEL ise:
-    - HTML içinden büyük/ana görselin URL'sini bul
-    - Görseli indir
-    - OCR ile metin çıkar
-    - 'Cumhuriyet' satırındaki sayıyı yakala
-    """
-    soup = BeautifulSoup(html, "html.parser")
-
-    # 1) En büyük/resim benzeri öğeyi seçmeye çalış
-    candidate_imgs = []
-    for img in soup.find_all("img"):
-        src = img.get("src") or ""
-        alt = (img.get("alt") or "").lower()
-        # Mutlak URL oluştur
-        if src.startswith("//"):
-            img_url = "https:" + src
-        elif src.startswith("/"):
-            img_url = "https://www.izko.org.tr" + src
+def notify_telegram(message: str) -> None:
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        print("[INFO] Telegram secrets eksik; bildirim atlanıyor.")
+        return
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    try:
+        r = requests.post(url, json={"chat_id": chat_id, "text": message}, headers=HEADERS, timeout=10)
+        if r.status_code == 200:
+            print("[INFO] Telegram bildirimi gönderildi.")
         else:
-            img_url = src
-        # Bazı ipuçları: genişlik/yükseklik, 'kur', 'guncel' gibi anahtarlar
-        w = int(img.get("width") or 0)
-        h = int(img.get("height") or 0)
-        score = 0
-        if "kur" in img_url.lower() or "guncel" in img_url.lower() or "altin" in img_url.lower():
-            score += 2
-        if w*h > 200000:  # büyük görsel
-            score += 3
-        candidate_imgs.append((score, img_url))
-
-    candidate_imgs.sort(reverse=True)
-    for _, img_url in candidate_imgs[:3]:  # en iyi 3 adayı dene
-        try:
-            r = requests.get(img_url, headers=HEADERS, timeout=10)
-            if r.status_code != 200:
-                continue
-            im = Image.open(BytesIO(r.content))
-            # OCR: Türkçe metin ağırlıklı ama rakamlar önemli; dil belirtmeden de iş görür
-            text = pytesseract.image_to_string(im)
-            if not text:
-                continue
-
-            # Metin satırlar halinde tara: 'Cumhuriyet' geçen satırda sayı ara
-            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-            for ln in lines:
-                if re.search(r"Cumhuriyet", ln, flags=re.IGNORECASE):
-                    # aynı satırda veya bir sonraki satırda sayı olabilir
-                    bucket = " ".join([ln] + lines[lines.index(ln)+1:lines.index(ln)+2])
-                    m = re.search(r"([0-9][0-9\.\,]{2,})", bucket)
-                    if m:
-                        val = _turkish_number_to_decimal(m.group(1))
-                        if val and val >= Decimal(1000):
-                            print(f"[INFO] OCR ile bulundu: {val} (kaynak: {img_url})")
-                            return val
-        except Exception as e:
-            print(f"[WARN] OCR denemesi başarısız ({img_url}): {e}")
-
-    print("[WARN] OCR ile de bulunamadı.")
-    return None
-
-def parse_price_neighborhood(html: str) -> Decimal | None:
-    for m in re.finditer(r"Cumhuriyet", html, flags=re.IGNORECASE):
-        start = m.start()
-        window = html[start : start + 4000]
-        # penceredeki tüm sayı benzeri bloklar
-        nums = re.findall(r"([0-9][0-9\.\,\s]{2,})", window)
-        for num_txt in nums:
-            val = _turkish_number_to_decimal(num_txt)
-            if val and val >= Decimal(1000):
-                print(f"[INFO] Neighborhood ile bulundu (SATIŞ): {num_txt} -> {val}")
-                return val
-    print("[WARN] Neighborhood ile de bulunamadı.")
-    return None
-
+            print(f"[WARN] Telegram status {r.status_code}: {r.text[:200]}")
+    except requests.RequestException as e:
+        print(f"[WARN] Telegram isteği hata verdi: {e}")
 
 def load_last_price() -> Decimal | None:
     if not STATE_FILE.exists():
@@ -338,78 +111,75 @@ def save_last_price(price: Decimal) -> None:
         json.dump(payload, f, ensure_ascii=False, indent=2)
     print(f"[INFO] last_price.json güncellendi: {payload}")
 
-def _istanbul_now_str() -> tuple[str, str]:
-    tz = pytz.timezone("Europe/Istanbul")
-    now = datetime.now(tz)
-    offset = now.utcoffset()
-    total_minutes = int((offset.total_seconds() if offset else 3*3600) // 60)
-    sign = "+" if total_minutes >= 0 else "-"
-    total_minutes = abs(total_minutes)
-    hh, mm = divmod(total_minutes, 60)
-    return now.strftime("%Y-%m-%d %H:%M:%S"), f"{sign}{hh:02d}:{mm:02d}"
-
-def build_message(old_price: Decimal, new_price: Decimal) -> str:
-    dt_str, offset = _istanbul_now_str()
-    return (
-        "İZKO Cumhuriyet Altını fiyatı değişti!\n"
-        f"Eski: {_format_tl(old_price)} TL\n"
-        f"Yeni: {_format_tl(new_price)} TL\n"
-        "Kaynak: izko.org.tr\n"
-        f"Zaman: {dt_str} ({offset})"
-    )
-
-def notify_telegram(message: str) -> None:
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID")
-    if not token or not chat_id:
-        print("[INFO] Telegram secrets eksik; Telegram bildirimi atlanıyor.")
-        return
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
+def get_price_via_headless_dom(url: str) -> Decimal | None:
+    """
+    JS sonrası DOM'dan 30410 gibi fiyatı okur.
+    1) '#row7_satis #ataLabel' -> textContent
+    2) Olmazsa: 'tr:has-text("Cumhuriyet")' satırındaki ilk makul sayı
+    """
     try:
-        r = requests.post(url, json={"chat_id": chat_id, "text": message},
-                          headers=HEADERS, timeout=10)
-        if r.status_code == 200:
-            print("[INFO] Telegram bildirimi gönderildi.")
-        else:
-            print(f"[WARN] Telegram status {r.status_code}: {r.text[:200]}")
-    except requests.RequestException as e:
-        print(f"[WARN] Telegram isteği hata verdi: {e}")
+        from playwright.sync_api import sync_playwright
+    except Exception as e:
+        print(f"[ERROR] Playwright import edilemedi: {e}")
+        return None
+
+    # 3 deneme, küçük backoff ile
+    for attempt in range(1, 4):
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch()
+                context = browser.new_context(locale="tr-TR", timezone_id="Europe/Istanbul")
+                page = context.new_page(viewport={"width": 1280, "height": 1600})
+                page.goto(url, timeout=30000, wait_until="networkidle")
+
+                # 1) Doğrudan hedef seçici
+                try:
+                    page.wait_for_selector("#row7_satis #ataLabel", timeout=5000)
+                    txt = page.eval_on_selector("#row7_satis #ataLabel", "el => (el.textContent || '').trim()")
+                except Exception:
+                    txt = ""
+
+                # 2) Satırdan yakala (Cumhuriyet satırı)
+                if not txt:
+                    row = page.locator("tr:has-text('Cumhuriyet')").first
+                    if row and row.count() >= 0:
+                        try:
+                            row.wait_for(timeout=3000)
+                        except Exception:
+                            pass
+                        row_text = row.inner_text(timeout=5000) if row else ""
+                        # Satırdaki tüm sayılardan makul olanı seç (>= 1000)
+                        m = re.search(r"([0-9][0-9\.\,\s]{2,})", row_text)
+                        txt = m.group(1) if m else ""
+
+                browser.close()
+
+                if not txt:
+                    print(f"[WARN] Headless DOM denemesi (attempt {attempt}): metin boş.")
+                else:
+                    val = _turkish_number_to_decimal(txt)
+                    if val and val >= Decimal(1000):
+                        print(f"[INFO] Headless DOM ile bulundu: {val}")
+                        return val
+                    else:
+                        print(f"[WARN] Headless DOM sayı makul değil: '{txt}' (attempt {attempt})")
+
+        except Exception as e:
+            print(f"[WARN] Headless DOM hata (attempt {attempt}): {e}")
+
+    print("[ERROR] Headless DOM ile fiyat bulunamadı.")
+    return None
 
 def main() -> int:
-    html = fetch_html(URL)
-    if not html:
-        print("[ERROR] HTML alınamadığı için işlenemedi. Exit 0 (workflow kırılmasın).")
-        return 0
-
-    # 0) Hedefli: row7_satis
-    price = parse_price_row7(html)
-
-    # 1) Diğer yöntemler (gerekirse)
-    if price is None:
-        price = parse_price_via_table(html) if 'parse_price_via_table' in globals() else None
-    if price is None:
-        price = parse_price_with_bs4(html)
-    if price is None:
-        price = parse_price_with_regex(html)
-    if price is None:
-        price = parse_price_neighborhood(html)
-    if price is None:
-        # varsa en sonda headless/OCR denemeleri
-        try:
-            price = parse_price_via_ocr(html)
-        except NameError:
-            pass
-        if price is None:
-            try:
-                price = parse_price_via_headless_ocr(URL)
-            except NameError:
-                pass
+    # 1) Headless DOM yöntemi (asıl yol)
+    price = get_price_via_headless_dom(URL)
 
     if price is None:
         print("[ERROR] Fiyat ayrıştırılamadı. Exit 0 (workflow kırılmasın).")
         return 0
 
     price = price.quantize(Decimal("1"))
+
     last = load_last_price()
     if last is None:
         print(f"[INFO] İlk tespit (baseline): {_format_tl(price)} TL. Bildirim YOK.")
@@ -422,6 +192,7 @@ def main() -> int:
         save_last_price(price)
     else:
         print(f"[INFO] Değişim yok. Güncel fiyat: {_format_tl(price)} TL")
+
     return 0
 
 if __name__ == "__main__":
