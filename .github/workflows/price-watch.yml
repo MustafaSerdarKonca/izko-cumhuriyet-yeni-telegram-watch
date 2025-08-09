@@ -1,0 +1,45 @@
+name: IZKO Cumhuriyet (YENİ) Price Watch (Telegram)
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # Her 5 dakikada bir
+  workflow_dispatch: {}      # Elle tetikleme
+
+permissions:
+  contents: write            # state/last_price.json'ı commit'lemek için
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    env:
+      TZ: Europe/Istanbul
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scraper & telegram notifier
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scrape_and_notify.py
+
+      - name: Commit state if changed
+        run: |
+          if [ -n "$(git status --porcelain state/last_price.json 2>/dev/null)" ]; then
+            echo "State değişmiş. Commit ve push yapılıyor..."
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add state/last_price.json
+            git commit -m "Update state/last_price.json [skip ci]"
+            git push
+          else
+            echo "State değişmemiş. Commit yok."
+          fi
