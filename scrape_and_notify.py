@@ -33,10 +33,11 @@ URL = "https://www.izko.org.tr/Home/GuncelKur"
 STATE_DIR = Path("state")
 STATE_FILE = STATE_DIR / "last_price.json"
 
-# Daha geniş pencere + sayı grubunda boşlukları da kabul et
+# 'Cumhuriyet'ten sonra ilk anlamlı sayıyı al (ör. 30410)
 FALLBACK_REGEX = re.compile(
-    r"Cumhuriyet[\s\S]{0,4000}?YEN[İI][\s:]*([0-9\.\,\s]+)", re.IGNORECASE
+    r"Cumhuriyet[\s\S]{0,4000}?([0-9][0-9\.\,\s]{2,})", re.IGNORECASE
 )
+
 
 HEADERS = {
     "User-Agent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -78,7 +79,12 @@ def _format_tl(n: Decimal | int | float) -> str:
     return f"{as_int:,}".replace(",", ".")
 
 def parse_price_with_bs4(html: str) -> Decimal | None:
+    """
+    'Cumhuriyet' geçen satırı bul, aynı satır/ebeveyn bağlamındaki İLK anlamlı sayıyı çek.
+    (Sayfa 'Cumhuriyet' fiyatını SATIŞ sütununda veriyor.)
+    """
     soup = BeautifulSoup(html, "html.parser")
+
     candidates = soup.find_all(string=re.compile(r"Cumhuriyet", re.IGNORECASE))
     for text_node in candidates:
         row = text_node.find_parent("tr") if getattr(text_node, "find_parent", None) else None
@@ -86,28 +92,29 @@ def parse_price_with_bs4(html: str) -> Decimal | None:
         if not container:
             continue
 
-        # 1) satır içinde ara
+        # Önce satır metninde tara
         ctx_text = container.get_text(" ", strip=True)
-        m = re.search(r"YEN[İI][\s:]*([0-9\.\,\s]+)", ctx_text, re.IGNORECASE)
+        m = re.search(r"([0-9][0-9\.\,\s]{2,})", ctx_text)
         if m:
             val = _turkish_number_to_decimal(m.group(1))
-            if val is not None:
-                print(f"[INFO] BS4 ile bulundu: {m.group(1)} -> {val}")
+            if val and val >= Decimal(1000):
+                print(f"[INFO] BS4 ile bulundu (SATIŞ): {m.group(1)} -> {val}")
                 return val
 
-        # 2) ebeveyn içinde ara (layout farklı olabilir)
+        # Olmazsa ebeveynde dene (bazı layoutlarda satır kırık olabiliyor)
         parent = container.find_parent() if hasattr(container, "find_parent") else None
         if parent:
             ptxt = parent.get_text(" ", strip=True)
-            m2 = re.search(r"YEN[İI][\s:]*([0-9\.\,\s]+)", ptxt, re.IGNORECASE)
+            m2 = re.search(r"([0-9][0-9\.\,\s]{2,})", ptxt)
             if m2:
                 val2 = _turkish_number_to_decimal(m2.group(1))
-                if val2 is not None:
-                    print(f"[INFO] BS4 (ebeveyn) ile bulundu: {m2.group(1)} -> {val2}")
+                if val2 and val2 >= Decimal(1000):
+                    print(f"[INFO] BS4 (ebeveyn) ile bulundu (SATIŞ): {m2.group(1)} -> {val2}")
                     return val2
 
     print("[WARN] BS4 ile fiyat bulunamadı; regex fallback denenecek.")
     return None
+
 
 def parse_price_via_table(html: str) -> Decimal | None:
     """
@@ -257,57 +264,19 @@ def parse_price_via_ocr(html: str) -> Decimal | None:
     return None
 
 def parse_price_neighborhood(html: str) -> Decimal | None:
-    """
-    'Cumhuriyet' görülen her noktadan sonra bir pencere alır,
-    önce pencereyi HTML'den arındırıp düz metin yapar, sonra
-    'YENİ' yakınındaki gerçek sayıyı seçer.
-    """
     for m in re.finditer(r"Cumhuriyet", html, flags=re.IGNORECASE):
         start = m.start()
-        window_html = html[start : start + 5000]  # geniş pencere
-
-        # 1) Pencereyi düz METNE çevir (tag'leri at)
-        window_text = BeautifulSoup(window_html, "html.parser").get_text(" ", strip=True)
-
-        # 2) 'YENİ' den sonra ilk "sayı blok"u yakala (boşluk/nokta/virgül serbest)
-        m2 = re.search(r"YEN[İI]\s*[:\-]?\s*([0-9\.\,\s]{3,})", window_text, flags=re.IGNORECASE)
-        candidates = []
-        if m2:
-            candidates.append(m2.group(1))
-
-        # 3) Yedek: penceredeki TÜM sayı benzeri blokları topla (4–7 hane civarı)
-        candidates += re.findall(r"([0-9][0-9\.\,\s]{2,})", window_text)
-
-        # 4) Adayları sayıya çevir, 0 yığınlarını ve çok küçükleri ele, en büyük mantıklı olanı seç
-        parsed = []
-        for c in candidates:
-            c_clean = c.replace("\xa0", " ").strip()
-            # "0 0 0 0" gibi saçmalıkları at
-            if re.fullmatch(r"[0\s\.,]+", c_clean):
-                continue
-            val = _turkish_number_to_decimal(c_clean)
-            if val is None:
-                continue
-            # 3 haneli ve altını ele (altın fiyatı için anlamsız); istersen 1000 eşiğini değiştir
-            if val < Decimal(1000):
-                continue
-            parsed.append(val)
-
-        if parsed:
-            best = max(parsed)  # penceredeki en makul büyük değer
-            print(f"[INFO] Neighborhood (text) ile bulundu: {best}")
-            return best
-
-    # DEBUG: ilk 'Cumhuriyet' çevresini logla
-    m_first = re.search(r"Cumhuriyet", html, flags=re.IGNORECASE)
-    if m_first:
-        i = m_first.start()
-        lo = max(0, i - 200)
-        hi = min(len(html), i + 600)
-        context = BeautifulSoup(html[lo:hi], "html.parser").get_text(" ", strip=True)
-        print("[DEBUG] 'Cumhuriyet' çevresi (metin):")
-        print(context[:300])
+        window = html[start : start + 4000]
+        # penceredeki tüm sayı benzeri bloklar
+        nums = re.findall(r"([0-9][0-9\.\,\s]{2,})", window)
+        for num_txt in nums:
+            val = _turkish_number_to_decimal(num_txt)
+            if val and val >= Decimal(1000):
+                print(f"[INFO] Neighborhood ile bulundu (SATIŞ): {num_txt} -> {val}")
+                return val
+    print("[WARN] Neighborhood ile de bulunamadı.")
     return None
+
 
 def load_last_price() -> Decimal | None:
     if not STATE_FILE.exists():
