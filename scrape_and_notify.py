@@ -106,6 +106,78 @@ def parse_price_with_bs4(html: str) -> Decimal | None:
     print("[WARN] BS4 ile fiyat bulunamadı; regex fallback denenecek.")
     return None
 
+def parse_price_via_table(html: str) -> Decimal | None:
+    """
+    Tablo tabanlı ayrıştırma:
+    - Sayfadaki ilk/uygun <table> içinde thead/th başlıkları ara.
+    - 'Cumhuriyet' yazan satırı (tr) bul.
+    - Başlıklarda 'YENİ' hangi sütundaysa o hücrenin (td) metnini sayıya çevir.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    # 1) Tabloları sırayla dene
+    for table in soup.find_all("table"):
+        # Başlıkları topla
+        headers = []
+        thead = table.find("thead")
+        if thead:
+            ths = thead.find_all(["th", "td"])
+            headers = [th.get_text(" ", strip=True) for th in ths]
+
+        # thead yoksa ilk satırı başlık kabul etmeyi deneyelim
+        if not headers:
+            first_tr = table.find("tr")
+            if first_tr:
+                headers = [c.get_text(" ", strip=True) for c in first_tr.find_all(["th","td"])]
+
+        if not headers:
+            continue
+
+        # 'YENİ' sütun index'ini bul (toleranslı)
+        yeni_idx = None
+        for i, h in enumerate(headers):
+            ht = (h or "").strip().upper()
+            if "YEN" in ht:  # 'YENİ' / 'YENI' / 'YEN ' vb.
+                yeni_idx = i
+                break
+        if yeni_idx is None:
+            continue
+
+        # 2) Gövdede 'Cumhuriyet' geçen satırı bul
+        tbody = table.find("tbody") or table
+        for tr in tbody.find_all("tr"):
+            row_text = tr.get_text(" ", strip=True)
+            if not re.search(r"Cumhuriyet", row_text, flags=re.IGNORECASE):
+                continue
+
+            # Satırdaki hücreleri al
+            cells = tr.find_all(["td", "th"])
+            if not cells or yeni_idx >= len(cells):
+                continue
+
+            # 'YENİ' sütunundaki ham metin
+            yeni_cell = cells[yeni_idx]
+            # Hücre içinde ikon/span vs. olabilir; düz metni al
+            raw = yeni_cell.get_text(" ", strip=True)
+            # Eğer metin boşsa, içerikteki 'data-*' attribute’larına da bak (bazı siteler sayıyı attribute’ta tutar)
+            if not raw:
+                for attr, val in yeni_cell.attrs.items():
+                    if isinstance(val, str) and re.search(r"[0-9]", val):
+                        raw = val
+                        break
+
+            # Hücre içinden sayı çek (esnek)
+            m = re.search(r"([0-9][0-9\.\,\s]{1,})", raw)
+            num_txt = m.group(1) if m else raw
+
+            val = _turkish_number_to_decimal(num_txt)
+            if val is not None and val >= Decimal(1000):
+                print(f"[INFO] Tabloyla bulundu (YENİ): {num_txt} -> {val}")
+                return val
+
+    print("[WARN] Tablo tabanlı ayrıştırma başarısız.")
+    return None
+
 def parse_price_with_regex(html: str) -> Decimal | None:
     m = FALLBACK_REGEX.search(html)
     if not m:
@@ -236,10 +308,18 @@ def main() -> int:
         print("[ERROR] HTML alınamadığı için işlenemedi. Exit 0 (workflow kırılmasın).")
         return 0
 
-    # 1) BS4 → 2) Regex → 3) Komşuluk
-    price = parse_price_with_bs4(html)
+    # 0) Tablo başlık–sütun eşlemesiyle dene
+    price = parse_price_via_table(html)
+
+    # 1) BS4 (serbest metin) ile dene
+    if price is None:
+        price = parse_price_with_bs4(html)
+
+    # 2) Regex fallback
     if price is None:
         price = parse_price_with_regex(html)
+
+    # 3) Komşuluk (BS4 ile düz metne çevirip sayı seçme)
     if price is None:
         price = parse_price_neighborhood(html)
 
