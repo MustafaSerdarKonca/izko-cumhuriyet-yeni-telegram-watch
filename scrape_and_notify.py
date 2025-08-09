@@ -25,6 +25,9 @@ from pathlib import Path
 import pytz
 import requests
 from bs4 import BeautifulSoup
+from io import BytesIO
+from PIL import Image
+import pytesseract
 
 URL = "https://www.izko.org.tr/Home/GuncelKur"
 STATE_DIR = Path("state")
@@ -190,6 +193,69 @@ def parse_price_with_regex(html: str) -> Decimal | None:
     print(f"[INFO] Regex ile bulundu: {m.group(1)} -> {val}")
     return val
 
+
+def parse_price_via_ocr(html: str) -> Decimal | None:
+    """
+    Sayfada görünen fiyat tablosu bir GÖRSEL ise:
+    - HTML içinden büyük/ana görselin URL'sini bul
+    - Görseli indir
+    - OCR ile metin çıkar
+    - 'Cumhuriyet' satırındaki sayıyı yakala
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    # 1) En büyük/resim benzeri öğeyi seçmeye çalış
+    candidate_imgs = []
+    for img in soup.find_all("img"):
+        src = img.get("src") or ""
+        alt = (img.get("alt") or "").lower()
+        # Mutlak URL oluştur
+        if src.startswith("//"):
+            img_url = "https:" + src
+        elif src.startswith("/"):
+            img_url = "https://www.izko.org.tr" + src
+        else:
+            img_url = src
+        # Bazı ipuçları: genişlik/yükseklik, 'kur', 'guncel' gibi anahtarlar
+        w = int(img.get("width") or 0)
+        h = int(img.get("height") or 0)
+        score = 0
+        if "kur" in img_url.lower() or "guncel" in img_url.lower() or "altin" in img_url.lower():
+            score += 2
+        if w*h > 200000:  # büyük görsel
+            score += 3
+        candidate_imgs.append((score, img_url))
+
+    candidate_imgs.sort(reverse=True)
+    for _, img_url in candidate_imgs[:3]:  # en iyi 3 adayı dene
+        try:
+            r = requests.get(img_url, headers=HEADERS, timeout=10)
+            if r.status_code != 200:
+                continue
+            im = Image.open(BytesIO(r.content))
+            # OCR: Türkçe metin ağırlıklı ama rakamlar önemli; dil belirtmeden de iş görür
+            text = pytesseract.image_to_string(im)
+            if not text:
+                continue
+
+            # Metin satırlar halinde tara: 'Cumhuriyet' geçen satırda sayı ara
+            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+            for ln in lines:
+                if re.search(r"Cumhuriyet", ln, flags=re.IGNORECASE):
+                    # aynı satırda veya bir sonraki satırda sayı olabilir
+                    bucket = " ".join([ln] + lines[lines.index(ln)+1:lines.index(ln)+2])
+                    m = re.search(r"([0-9][0-9\.\,]{2,})", bucket)
+                    if m:
+                        val = _turkish_number_to_decimal(m.group(1))
+                        if val and val >= Decimal(1000):
+                            print(f"[INFO] OCR ile bulundu: {val} (kaynak: {img_url})")
+                            return val
+        except Exception as e:
+            print(f"[WARN] OCR denemesi başarısız ({img_url}): {e}")
+
+    print("[WARN] OCR ile de bulunamadı.")
+    return None
+
 def parse_price_neighborhood(html: str) -> Decimal | None:
     """
     'Cumhuriyet' görülen her noktadan sonra bir pencere alır,
@@ -308,20 +374,24 @@ def main() -> int:
         print("[ERROR] HTML alınamadığı için işlenemedi. Exit 0 (workflow kırılmasın).")
         return 0
 
-    # 0) Tablo başlık–sütun eşlemesiyle dene
+    # 0) Tablo dene
     price = parse_price_via_table(html)
 
-    # 1) BS4 (serbest metin) ile dene
+    # 1) BS4
     if price is None:
         price = parse_price_with_bs4(html)
 
-    # 2) Regex fallback
+    # 2) Regex
     if price is None:
         price = parse_price_with_regex(html)
 
-    # 3) Komşuluk (BS4 ile düz metne çevirip sayı seçme)
+    # 3) Neighborhood (metne çevirme)
     if price is None:
         price = parse_price_neighborhood(html)
+
+    # 4) **OCR** (en son çare)
+    if price is None:
+        price = parse_price_via_ocr(html)
 
     if price is None:
         print("[ERROR] Fiyat ayrıştırılamadı. Exit 0 (workflow kırılmasın).")
