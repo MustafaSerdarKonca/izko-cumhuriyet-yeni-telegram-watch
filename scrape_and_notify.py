@@ -33,7 +33,7 @@ STATE_FILE = STATE_DIR / "last_price.json"
 
 # Regex fallback (case-insensitive)
 FALLBACK_REGEX = re.compile(
-    r"Cumhuriyet[\s\S]{0,120}?YENİ\s*:?\s*([0-9\.,]+)", re.IGNORECASE
+    r"Cumhuriyet[\s\S]{0,4000}?YENİ\s*:?\s*([0-9\.,]+)", re.IGNORECASE
 )
 
 HEADERS = {
@@ -131,6 +131,34 @@ def parse_price_with_regex(html: str) -> Decimal | None:
         return None
     print(f"[INFO] Regex ile bulundu: {num_txt} -> {val}")
     return val
+
+def parse_price_neighborhood(html: str) -> Decimal | None:
+    """
+    Komşuluk araması: 'Cumhuriyet' görülen her pozisyonda, sonraki 2000 karakter içinde
+    'YENİ' ve onu izleyen sayı desenini yakalamaya çalışır.
+    """
+    for m in re.finditer(r"Cumhuriyet", html, flags=re.IGNORECASE):
+        start = m.start()
+        window = html[start : start + 2000]  # ileriye doğru bak
+        # 'YENİ' yi ve onu izleyen sayıyı ara:
+        m2 = re.search(r"YENİ[\s:]*([0-9\.\,\s]+)", window, flags=re.IGNORECASE)
+        if m2:
+            num_txt = m2.group(1)
+            val = _turkish_number_to_decimal(num_txt)
+            if val is not None:
+                print(f"[INFO] Neighborhood ile bulundu: {num_txt} -> {val}")
+                return val
+
+    # Debug: ilk 'Cumhuriyet' etrafını logla (regex tutmadıysa yapıyı görürüz)
+    m_first = re.search(r"Cumhuriyet", html, flags=re.IGNORECASE)
+    if m_first:
+        i = m_first.start()
+        lo = max(0, i - 150)
+        hi = min(len(html), i + 400)
+        context = html[lo:hi]
+        print("[DEBUG] 'Cumhuriyet' çevresi (≈300 chars):")
+        print(context.replace("\n", " ")[:300])
+    return None
 
 def load_last_price() -> Decimal | None:
     """Önceki fiyatı state dosyasından okur; yoksa None döner."""
