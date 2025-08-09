@@ -4,7 +4,7 @@
 """
 İZKO 'Güncel Kur' sayfasındaki 'Cumhuriyet' satırındaki 'YENİ' fiyatı izler.
 - Önce BeautifulSoup ile DOM üzerinden çekmeye çalışır.
-- Olmazsa regex fallback uygular: r"Cumhuriyet[\s\S]{0,120}?YENİ\s*:?\s*([0-9\.,]+)"
+- Olmazsa regex fallback uygular: r"Cumhuriyet[\s\S]{0,4000}?YENİ\s*:?\s*([0-9\.,]+)"
 - Durumu state/last_price.json dosyasında tutar.
 - Değişim varsa TELEGRAM mesajı yollar.
 - İlk çalıştırmada baseline oluşturur, bildirim göndermez.
@@ -120,29 +120,54 @@ def parse_price_with_regex(html: str) -> Decimal | None:
 
 def parse_price_neighborhood(html: str) -> Decimal | None:
     """
-    'Cumhuriyet' görülen her noktadan sonra 4000 karakter pencere aç,
-    önce 'YENİ'yi bul, onun 400 karakter sonrasında ilk sayı desenini al.
+    'Cumhuriyet' görülen her noktadan sonra bir pencere alır,
+    önce pencereyi HTML'den arındırıp düz metin yapar, sonra
+    'YENİ' yakınındaki gerçek sayıyı seçer.
     """
     for m in re.finditer(r"Cumhuriyet", html, flags=re.IGNORECASE):
         start = m.start()
-        window = html[start : start + 4000]
-        yen = re.search(r"YEN[İI]", window, flags=re.IGNORECASE)
-        if not yen:
-            continue
-        after = window[yen.end(): yen.end()+400]
-        num = re.search(r"([0-9][0-9\.\,\s]{2,})", after)
-        if num:
-            val = _turkish_number_to_decimal(num.group(1))
-            if val is not None:
-                print(f"[INFO] Neighborhood ile bulundu: {num.group(1)} -> {val}")
-                return val
+        window_html = html[start : start + 5000]  # geniş pencere
+
+        # 1) Pencereyi düz METNE çevir (tag'leri at)
+        window_text = BeautifulSoup(window_html, "html.parser").get_text(" ", strip=True)
+
+        # 2) 'YENİ' den sonra ilk "sayı blok"u yakala (boşluk/nokta/virgül serbest)
+        m2 = re.search(r"YEN[İI]\s*[:\-]?\s*([0-9\.\,\s]{3,})", window_text, flags=re.IGNORECASE)
+        candidates = []
+        if m2:
+            candidates.append(m2.group(1))
+
+        # 3) Yedek: penceredeki TÜM sayı benzeri blokları topla (4–7 hane civarı)
+        candidates += re.findall(r"([0-9][0-9\.\,\s]{2,})", window_text)
+
+        # 4) Adayları sayıya çevir, 0 yığınlarını ve çok küçükleri ele, en büyük mantıklı olanı seç
+        parsed = []
+        for c in candidates:
+            c_clean = c.replace("\xa0", " ").strip()
+            # "0 0 0 0" gibi saçmalıkları at
+            if re.fullmatch(r"[0\s\.,]+", c_clean):
+                continue
+            val = _turkish_number_to_decimal(c_clean)
+            if val is None:
+                continue
+            # 3 haneli ve altını ele (altın fiyatı için anlamsız); istersen 1000 eşiğini değiştir
+            if val < Decimal(1000):
+                continue
+            parsed.append(val)
+
+        if parsed:
+            best = max(parsed)  # penceredeki en makul büyük değer
+            print(f"[INFO] Neighborhood (text) ile bulundu: {best}")
+            return best
 
     # DEBUG: ilk 'Cumhuriyet' çevresini logla
     m_first = re.search(r"Cumhuriyet", html, flags=re.IGNORECASE)
     if m_first:
-        i = m_first.start(); lo = max(0, i-150); hi = min(len(html), i+450)
-        context = html[lo:hi].replace("\n", " ")
-        print("[DEBUG] 'Cumhuriyet' çevresi (~300 chars):")
+        i = m_first.start()
+        lo = max(0, i - 200)
+        hi = min(len(html), i + 600)
+        context = BeautifulSoup(html[lo:hi], "html.parser").get_text(" ", strip=True)
+        print("[DEBUG] 'Cumhuriyet' çevresi (metin):")
         print(context[:300])
     return None
 
