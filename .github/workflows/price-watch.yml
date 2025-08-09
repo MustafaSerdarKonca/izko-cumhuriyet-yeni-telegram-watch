@@ -2,11 +2,11 @@ name: IZKO Cumhuriyet (YENİ) Price Watch (Telegram)
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
-  workflow_dispatch: {}
+    - cron: "*/5 * * * *"   # Her 5 dakikada bir
+  workflow_dispatch: {}      # Elle tetikleme
 
 permissions:
-  contents: write
+  contents: write            # state/last_price.json'ı commit'lemek için
 
 jobs:
   watch:
@@ -22,13 +22,10 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install Tesseract (for OCR)
+      - name: Install Python dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y tesseract-ocr
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
 
       - name: Run scraper & telegram notifier
         env:
