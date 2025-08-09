@@ -199,6 +199,44 @@ def parse_price_with_regex(html: str) -> Decimal | None:
         return None
     print(f"[INFO] Regex ile bulundu: {m.group(1)} -> {val}")
     return val
+    
+def parse_price_row7(html: str) -> Decimal | None:
+    """
+    Ekrandaki yapıya göre: <td id="row7_satis"> içinde <div id="ataLabel">30410</div>
+    Cumhuriyet SATIŞ değeri burada duruyor. Önce DOM ile, olmazsa regex ile al.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    td = soup.find(id="row7_satis")
+    if td:
+        # 1) <div id="ataLabel">30410</div> varsa onu al
+        div = td.find(id="ataLabel")
+        if div and div.get_text(strip=True):
+            val = _turkish_number_to_decimal(div.get_text(strip=True))
+            if val:
+                print(f"[INFO] row7_satis/ataLabel ile bulundu: {val}")
+                return val
+
+        # 2) Hücrenin düz metnindeki ilk sayıyı al (ikonları, span’leri yok sayar)
+        raw = td.get_text(" ", strip=True)
+        m = re.search(r"([0-9][0-9\.\,\s]{2,})", raw)
+        if m:
+            val = _turkish_number_to_decimal(m.group(1))
+            if val:
+                print(f"[INFO] row7_satis metniyle bulundu: {val}")
+                return val
+
+    # 3) DOM bulunamazsa: HTML üzerinde regex (id kalıbına göre)
+    m = re.search(r'id=["\']row7_satis["\'][\s\S]{0,300}?id=["\']ataLabel["\'][^>]*>([0-9\.\,\s]+)<',
+                  html, flags=re.IGNORECASE)
+    if m:
+        val = _turkish_number_to_decimal(m.group(1))
+        if val:
+            print(f"[INFO] row7_satis regex ile bulundu: {val}")
+            return val
+
+    print("[WARN] row7_satis içinde değer bulunamadı.")
+    return None
 
 
 def parse_price_via_ocr(html: str) -> Decimal | None:
@@ -343,24 +381,29 @@ def main() -> int:
         print("[ERROR] HTML alınamadığı için işlenemedi. Exit 0 (workflow kırılmasın).")
         return 0
 
-    # 0) Tablo dene
-    price = parse_price_via_table(html)
+    # 0) Hedefli: row7_satis
+    price = parse_price_row7(html)
 
-    # 1) BS4
+    # 1) Diğer yöntemler (gerekirse)
+    if price is None:
+        price = parse_price_via_table(html) if 'parse_price_via_table' in globals() else None
     if price is None:
         price = parse_price_with_bs4(html)
-
-    # 2) Regex
     if price is None:
         price = parse_price_with_regex(html)
-
-    # 3) Neighborhood (metne çevirme)
     if price is None:
         price = parse_price_neighborhood(html)
-
-    # 4) **OCR** (en son çare)
     if price is None:
-        price = parse_price_via_ocr(html)
+        # varsa en sonda headless/OCR denemeleri
+        try:
+            price = parse_price_via_ocr(html)
+        except NameError:
+            pass
+        if price is None:
+            try:
+                price = parse_price_via_headless_ocr(URL)
+            except NameError:
+                pass
 
     if price is None:
         print("[ERROR] Fiyat ayrıştırılamadı. Exit 0 (workflow kırılmasın).")
