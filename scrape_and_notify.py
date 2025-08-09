@@ -233,7 +233,17 @@ def main() -> int:
         print("[ERROR] HTML alınamadığı için işlenemedi. Exit 0 (workflow kırılmasın).")
         return 0
 
-    price = parse_price_with_bs4(html) or parse_price_with_regex(html)
+    # 1) Önce BeautifulSoup ile dene
+    price = parse_price_with_bs4(html)
+
+    # 2) Olmazsa regex fallback
+    if price is None:
+        price = parse_price_with_regex(html)
+
+    # 3) Hâlâ yoksa komşuluk yaklaşımı
+    if price is None:
+        price = parse_price_neighborhood(html)
+
     if price is None:
         print("[ERROR] Fiyat ayrıştırılamadı. Exit 0 (workflow kırılmasın).")
         return 0
@@ -258,3 +268,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
