@@ -6,13 +6,17 @@
 - Headless Chromium (Playwright) ile sayfayı render eder.
 - Önce '#row7_satis #ataLabel' seçicisinden okur.
 - Olmazsa 'tr:has-text("Cumhuriyet")' satırındaki ilk makul sayıyı alır.
-- Son fiyatı state/last_price.json içinde tutar; değişirse Telegram'a mesaj atar.
+- Son fiyatı state/last_price.json içinde tutar.
+- **Bildirim, son KAYITLI fiyata göre en az %THRESHOLD_PERCENT değişim olduğunda** gönderilir.
 - İlk çalıştırmada baseline oluşturur, bildirim göndermez.
 - Log'lar print() ile GitHub Actions'da görünür.
 
 Gereken Secrets:
 - TELEGRAM_BOT_TOKEN
 - TELEGRAM_CHAT_ID
+
+Opsiyonel Env:
+- THRESHOLD_PERCENT (varsayılan: "1.0")  # yüzde cinsinden, örn: "0.5" veya "2"
 """
 
 import os
@@ -20,7 +24,7 @@ import re
 import json
 from pathlib import Path
 from datetime import datetime
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 import pytz
 import requests
@@ -126,7 +130,6 @@ def get_price_via_headless_dom(url: str) -> Decimal | None:
     for attempt in range(1, 4):
         try:
             with sync_playwright() as p:
-                # viewport AYARI context'e verilir (new_page'e değil!)
                 browser = p.chromium.launch()
                 context = browser.new_context(
                     locale="tr-TR",
@@ -136,7 +139,6 @@ def get_price_via_headless_dom(url: str) -> Decimal | None:
                 page = context.new_page()
                 page.goto(url, timeout=30000, wait_until="networkidle")
 
-                # 1) Doğrudan hedef seçici
                 txt = ""
                 try:
                     page.wait_for_selector("#row7_satis #ataLabel", timeout=7000)
@@ -147,7 +149,6 @@ def get_price_via_headless_dom(url: str) -> Decimal | None:
                 except Exception:
                     pass
 
-                # 2) Cumhuriyet satırından yakala
                 if not txt:
                     row = page.locator("tr:has-text('Cumhuriyet')").first
                     try:
@@ -187,6 +188,15 @@ def main() -> int:
 
     price = price.quantize(Decimal("1"))
 
+    # ---- Yüzdesel eşik ayarı ----
+    try:
+        threshold_percent = Decimal(os.getenv("THRESHOLD_PERCENT", "1.0"))
+    except Exception:
+        threshold_percent = Decimal("1.0")
+    if threshold_percent <= 0:
+        threshold_percent = Decimal("1.0")
+    # -----------------------------
+
     last = load_last_price()
     if last is None:
         print(f"[INFO] İlk tespit (baseline): {_format_tl(price)} TL. Bildirim YOK.")
@@ -194,9 +204,18 @@ def main() -> int:
         return 0
 
     if price != last:
-        print(f"[INFO] Değişim tespit edildi: {_format_tl(last)} -> {_format_tl(price)} TL")
-        notify_telegram(build_message(last, price))
-        save_last_price(price)
+        diff = (price - last).copy_abs()
+        # yüzdeyi iki ondalığa yuvarla
+        change_pct = (diff / last * Decimal("100")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+        if change_pct >= threshold_percent:
+            print(f"[INFO] Eşik aşıldı: fark {_format_tl(diff)} TL (%{change_pct}) >= %{threshold_percent}")
+            notify_telegram(build_message(last, price))
+            save_last_price(price)  # sadece bildirimde state'i güncelle
+        else:
+            print(f"[INFO] Değişim var ama eşik altında: {_format_tl(last)} -> {_format_tl(price)} TL "
+                  f"(%{change_pct} < %{threshold_percent}). Bildirim YOK.")
+            # state'i güncellemiyoruz; böylece küçük değişimler birikerek eşiği geçince mesaj gelir
     else:
         print(f"[INFO] Değişim yok. Güncel fiyat: {_format_tl(price)} TL")
 
